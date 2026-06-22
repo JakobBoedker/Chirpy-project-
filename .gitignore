@@ -1,3 +1,2 @@
-.devenv.lock
-.devenv.nix
+.devenv?
 .devenv/
