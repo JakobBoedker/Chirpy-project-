@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bootdev-go-server/internal"
 	"bootdev-go-server/internal/database"
 	"database/sql"
 	"encoding/json"
@@ -23,10 +24,11 @@ type apiConfig struct {
 }
 
 type User struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
+	ID             uuid.UUID `json:"id"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	Email          string    `json:"email"`
+	HashedPassword string    `json:"password"`
 }
 
 type Chirp struct {
@@ -49,6 +51,39 @@ func initDB() (*database.Queries, error) {
 	}
 
 	return database.New(dbConn), nil
+
+}
+
+func (cfg *apiConfig) getSingleChirp(w http.ResponseWriter, r *http.Request) {
+	chirpIDString := r.PathValue("chirpID")
+	chirpID, err := uuid.Parse(chirpIDString)
+	if err != nil {
+		w.WriteHeader(500)
+		log.Fatal(500)
+	}
+
+	single, err := cfg.db.GetOneChirp(r.Context(), chirpID)
+	if err != nil {
+		w.WriteHeader(404)
+		return
+	}
+
+	newChirp := Chirp{
+		ID:        single.ID,
+		CreatedAt: single.CreatedAt,
+		UpdatedAt: single.UpdatedAt,
+		Body:      single.Body,
+		User_id:   single.UserID,
+	}
+
+	data, err := json.Marshal(newChirp)
+	if err != nil {
+		w.WriteHeader(500)
+		log.Fatal(err)
+	}
+
+	w.WriteHeader(200)
+	w.Write(data)
 
 }
 
@@ -82,9 +117,43 @@ func (cfg *apiConfig) handleReset(w http.ResponseWriter, r *http.Request) {
 
 }
 
+func (cfg *apiConfig) getChrips(w http.ResponseWriter, r *http.Request) {
+	allItems, err := cfg.db.GetAllChrips(r.Context())
+	if err != nil {
+		w.WriteHeader(500)
+		log.Fatal(err)
+		return
+	}
+
+	var formattedChrips []Chirp
+
+	for _, chirp := range allItems {
+		newChirp := Chirp{
+			ID:        chirp.ID,
+			CreatedAt: chirp.CreatedAt,
+			UpdatedAt: chirp.UpdatedAt,
+			Body:      chirp.Body,
+			User_id:   chirp.UserID,
+		}
+		formattedChrips = append(formattedChrips, newChirp)
+
+	}
+
+	data, err := json.Marshal(formattedChrips)
+	if err != nil {
+		w.WriteHeader(500)
+		log.Fatal(err)
+		return
+	}
+
+	w.WriteHeader(200)
+	w.Write(data)
+}
+
 func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	type params struct {
-		Email string `json:"email"`
+		Password string `json:"password"`
+		Email    string `json:"email"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
@@ -96,22 +165,41 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	hashThatPassword, err := internal.HashPassword(param.Password)
+	if err != nil {
+		w.WriteHeader(500)
+		log.Fatal(err)
+		return
+	}
+
+	newUser := database.CreateUserParams{
+		HashedPassword: hashThatPassword,
+		Email:          param.Email,
+	}
+
 	defer r.Body.Close()
 
-	createdUser, err := cfg.db.CreateUser(r.Context(), param.Email)
+	createdUser, err := cfg.db.CreateUser(r.Context(), newUser)
 	if err != nil {
 		log.Fatal(err)
 		return
 	}
 
-	newUser := User{
+	type userWithoutPass struct {
+		ID        uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Email     string    `json:"email"`
+	}
+
+	newUser1 := userWithoutPass{
 		ID:        createdUser.ID,
 		CreatedAt: createdUser.CreatedAt,
 		UpdatedAt: createdUser.UpdatedAt,
 		Email:     createdUser.Email,
 	}
 
-	data, err := json.Marshal(newUser)
+	data, err := json.Marshal(newUser1)
 	if err != nil {
 		w.WriteHeader(500)
 		log.Printf("Server Error")
@@ -134,6 +222,61 @@ func (cfg *apiConfig) handleMetric(w http.ResponseWriter, r *http.Request) {
 			</body>
 		</html>
 	`, cfg.fileserverHits.Load())))
+}
+
+func (cfg *apiConfig) loginUser(w http.ResponseWriter, r *http.Request) {
+	type params struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
+	}
+
+	type userWithoutPass struct {
+		ID        uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Email     string    `json:"email"`
+	}
+	decode := json.NewDecoder(r.Body)
+	param := params{}
+	err := decode.Decode(&param)
+	if err != nil {
+		log.Printf("failed decoding")
+		w.WriteHeader(500)
+		return
+	}
+
+	loggedInUser, err := cfg.db.LogUserIn(r.Context(), param.Email)
+	if err != nil {
+		w.WriteHeader(401)
+		return
+	}
+
+	match, err := internal.CheckPasswordHash(param.Password, loggedInUser.HashedPassword)
+	if err != nil {
+		w.WriteHeader(500)
+		log.Fatal(err)
+		return
+	}
+
+	if !match {
+		w.WriteHeader(401)
+		return
+	}
+	newlogin := userWithoutPass{
+		ID:        loggedInUser.ID,
+		CreatedAt: loggedInUser.CreatedAt,
+		UpdatedAt: loggedInUser.UpdatedAt,
+		Email:     loggedInUser.Email,
+	}
+	data, err := json.Marshal(newlogin)
+	if err != nil {
+		w.WriteHeader(500)
+		log.Fatal(err)
+		return
+	}
+	w.WriteHeader(200)
+	w.Write(data)
+
 }
 
 func (cfg *apiConfig) validateChirpMiddelware(w http.ResponseWriter, r *http.Request) {
@@ -243,7 +386,13 @@ func main() {
 
 	mux.HandleFunc("POST /api/chirps", apiCfg.validateChirpMiddelware)
 
+	mux.HandleFunc("GET /api/chirps", apiCfg.getChrips)
+
+	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getSingleChirp)
+
 	mux.HandleFunc("POST /api/users", apiCfg.createUser)
+
+	mux.HandleFunc("POST /api/login", apiCfg.loginUser)
 
 	mux.HandleFunc("GET /admin/metrics", apiCfg.handleMetric)
 
