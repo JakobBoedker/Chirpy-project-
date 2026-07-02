@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bootdev-go-server/internal"
+	"bootdev-go-server/internal/auth"
 	"bootdev-go-server/internal/database"
 	"database/sql"
 	"encoding/json"
@@ -21,6 +21,7 @@ import (
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
+	secret         string
 }
 
 type User struct {
@@ -47,7 +48,7 @@ func initDB() (*database.Queries, error) {
 
 	dbConn, err := sql.Open("postgres", dbURL)
 	if err != nil {
-		log.Fatal("Error opening database: %s", err)
+		log.Fatalf("Error opening database: %s", err)
 	}
 
 	return database.New(dbConn), nil
@@ -165,7 +166,7 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hashThatPassword, err := internal.HashPassword(param.Password)
+	hashThatPassword, err := auth.HashPassword(param.Password)
 	if err != nil {
 		w.WriteHeader(500)
 		log.Fatal(err)
@@ -226,8 +227,9 @@ func (cfg *apiConfig) handleMetric(w http.ResponseWriter, r *http.Request) {
 
 func (cfg *apiConfig) loginUser(w http.ResponseWriter, r *http.Request) {
 	type params struct {
-		Password string `json:"password"`
-		Email    string `json:"email"`
+		Password   string `json:"password"`
+		Email      string `json:"email"`
+		Expires_in int    `json:"expires_in_seconds,omitempty"`
 	}
 
 	type userWithoutPass struct {
@@ -235,6 +237,7 @@ func (cfg *apiConfig) loginUser(w http.ResponseWriter, r *http.Request) {
 		CreatedAt time.Time `json:"created_at"`
 		UpdatedAt time.Time `json:"updated_at"`
 		Email     string    `json:"email"`
+		Token     string    `json:"token"`
 	}
 	decode := json.NewDecoder(r.Body)
 	param := params{}
@@ -251,7 +254,7 @@ func (cfg *apiConfig) loginUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	match, err := internal.CheckPasswordHash(param.Password, loggedInUser.HashedPassword)
+	match, err := auth.CheckPasswordHash(param.Password, loggedInUser.HashedPassword)
 	if err != nil {
 		w.WriteHeader(500)
 		log.Fatal(err)
@@ -262,11 +265,26 @@ func (cfg *apiConfig) loginUser(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(401)
 		return
 	}
+	var timeExpiresIn time.Duration
+
+	// make JWT token
+	if param.Expires_in == 0 || param.Expires_in >= 3600 {
+		timeExpiresIn = time.Duration(time.Hour)
+	} else {
+		timeExpiresIn = time.Duration(param.Expires_in) * time.Second
+	}
+	jwtToken, err := auth.MakeJWT(loggedInUser.ID, cfg.secret, timeExpiresIn)
+	if err != nil {
+		w.WriteHeader(500)
+		log.Fatal(err)
+	}
+
 	newlogin := userWithoutPass{
 		ID:        loggedInUser.ID,
 		CreatedAt: loggedInUser.CreatedAt,
 		UpdatedAt: loggedInUser.UpdatedAt,
 		Email:     loggedInUser.Email,
+		Token:     jwtToken,
 	}
 	data, err := json.Marshal(newlogin)
 	if err != nil {
@@ -299,6 +317,17 @@ func (cfg *apiConfig) validateChirpMiddelware(w http.ResponseWriter, r *http.Req
 		log.Printf("Faild Decoding")
 		w.WriteHeader(500)
 		return
+	}
+
+	getToken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		w.WriteHeader(500)
+		log.Fatal(err)
+	}
+
+	checkToken, err := auth.ValidateJWT(getToken, cfg.secret)
+	if err != nil {
+		w.WriteHeader(401)
 	}
 
 	// if chrip is longer than 140 chars
@@ -338,7 +367,7 @@ func (cfg *apiConfig) validateChirpMiddelware(w http.ResponseWriter, r *http.Req
 
 	chi := database.CreateChirpParams{
 		Body:   completeString,
-		UserID: param.User_id,
+		UserID: checkToken,
 	}
 
 	createChirp, err := cfg.db.CreateChirp(r.Context(), chi)
@@ -378,6 +407,7 @@ func main() {
 	apiCfg := apiConfig{
 		fileserverHits: atomic.Int32{},
 		db:             dbQueries,
+		secret:         os.Getenv("JWT_SECRET"),
 	}
 
 	const port = "8080"
